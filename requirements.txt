@@ -1,0 +1,9 @@
+datasets
+pandas
+matplotlib
+seaborn
+scikit-learn
+numpy
+networkx
+plotly
+ollama
