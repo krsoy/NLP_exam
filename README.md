@@ -1,5 +1,5 @@
 Project Link:https://github.com/krsoy/NLP_exam
-
+Video Link:https://youtu.be/W1t9-KhkqEw
 
 # 📘 Semantic Knowledge Graph of S&P 500 Earnings Call Transcripts (2024)
 ### Network Analysis & Topic Extraction using LLM + UMAP + Bipartite Graphs
