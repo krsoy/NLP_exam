@@ -7,3 +7,5 @@ numpy
 networkx
 plotly
 ollama
+umap-learn
+hdbscan
