@@ -1,0 +1,274 @@
+# 🚀 Step 1: Setup Environment and Pull Qwen2 model
+!pip install datasets ollama matplotlib networkx pandas tqdm
+
+import pandas as pd
+from datasets import load_dataset
+import networkx as nx
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import json
+import ollama
+
+# ✅ Pull the specific Qwen2 model
+print("Pulling Qwen2 model...")
+!ollama pull qwen2:7b-instruct-q4_K_M
+print("✅ Qwen2 model pulled successfully!")
+
+
+
+# Standard libraries
+from datasets import load_dataset
+import pandas as pd
+import numpy as np
+import re
+import json
+from collections import Counter
+
+# Visualization
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Network
+import networkx as nx
+
+# LLM
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+
+# Optional: Community detection
+try:
+    import community as community_louvain
+    HAS_LOUVAIN = True
+except ImportError:
+    HAS_LOUVAIN = False
+    print("python-louvain not installed → skipping community detection")
+
+# NLTK stopwords (English + Danish as per your spec)
+import nltk
+nltk.download('stopwords', quiet=True)
+from nltk.corpus import stopwords
+
+print("Imports complete.")
+
+# Load the S&P 500 earnings transcripts dataset from Hugging Face
+ds = load_dataset("kurry/sp500_earnings_transcripts", split="train")
+
+print(f"Total transcripts in dataset: {len(ds):,}")
+print(f"Columns: {list(ds[0].keys())}")
+
+# Inspect first transcript
+sample = ds[0]
+print(f"\nExample: {sample['symbol']} | {sample['company_name']} | Q{sample['quarter']} {sample['year']}")
+print(f"Number of speaker segments: {len(sample['structured_content'])}")
+print("\nFirst segment:")
+print(f"  Speaker: {sample['structured_content'][0]['speaker']}")
+print(f"  Text (preview): {sample['structured_content'][0]['text'][:200]}...")
+
+# Build a long-form DataFrame: one row per speaker utterance
+rows = []
+
+for t_id, rec in enumerate(ds):
+    meta = {
+        "transcript_id": t_id,
+        "symbol": rec["symbol"],
+        "company_name": rec["company_name"],
+        "date": rec["date"],
+        "quarter": rec["quarter"],
+        "year": rec["year"],
+    }
+    for seg_id, seg in enumerate(rec["structured_content"]):
+        rows.append({
+            **meta,
+            "seg_id": seg_id,
+            "speaker": seg["speaker"],
+            "text": seg["text"],
+            "len_chars": len(seg["text"]),
+        })
+
+utterances = pd.DataFrame(rows)
+utterances["date"] = pd.to_datetime(utterances["date"], errors="coerce")
+
+print(f"Total utterances: {len(utterances):,}")
+print(f"Unique companies: {utterances['company_name'].nunique():,}")
+print(f"Year range: {utterances['year'].min()} → {utterances['year'].max()}")
+
+utterances.head()
+
+# Filter to 2024
+d = utterances[utterances["year"] == 2024].copy().reset_index(drop=True)
+
+print(f"Utterances in 2024: {len(d):,}")
+print(f"Unique companies in 2024: {d['company_name'].nunique():,}")
+print(f"Date range: {d['date'].min().date()} → {d['date'].max().date()}")
+
+# Quick check: top speakers
+print("\nTop 10 speaker types in 2024:")
+print(d["speaker"].value_counts().head(10))
+
+# Aggregate all utterances per company into one document
+company_docs = (
+    d.groupby(["symbol", "company_name"], as_index=False)
+     .agg(
+         full_text=("text", lambda x: " ".join(x.astype(str))),
+         first_date=("date", "min"),
+         last_date=("date", "max"),
+         n_utterances=("text", "count")
+     )
+)
+
+# Add word count
+company_docs["word_count"] = company_docs["full_text"].str.split().str.len()
+
+print(f"Company documents (2024): {len(company_docs)}")
+print(f"Avg. words per company: {company_docs['word_count'].mean():.0f}")
+print(f"Most verbose: {company_docs.loc[company_docs['word_count'].idxmax(), 'company_name']} "
+      f"({company_docs['word_count'].max():,} words)")
+
+company_docs = company_docs.sort_values("word_count", ascending=False).reset_index(drop=True)
+company_docs.head()
+
+# ------------------------------------------------------------
+# Cell 7 – LLM Setup + Light Pre-processing (CPU only)
+# ------------------------------------------------------------
+
+# 1. Stop-words (English + Danish)
+import nltk
+nltk.download('stopwords', quiet=True)
+from nltk.corpus import stopwords
+
+stop_en = set(stopwords.words("english"))
+stop_da = set(stopwords.words("danish"))
+STOP_WORDS = stop_en.union(stop_da)
+print(f"Total stop-words: {len(STOP_WORDS)}")
+
+# 2. Simple text cleaner (remove stop-words, keep >2-char words)
+def clean_text(txt: str, max_chars: int = 1500) -> str:
+    words = txt.lower().split()
+    words = [w for w in words if w not in STOP_WORDS and len(w) > 2]
+    out = " ".join(words)
+    return out[:max_chars]                     # truncate for speed
+
+# 3. Load a **tiny** Qwen model that runs on CPU
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+
+MODEL_NAME = "Qwen/Qwen2-1.5B-Instruct"        # ~1.5 B params, works on CPU
+
+print("\nLoading tokenizer & model (CPU)…")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.float32,   # float32 = CPU-compatible
+    device_map=None,            # forces CPU
+    trust_remote_code=True
+)
+print(f"Model loaded on {model.device}")
+
+# 4. One-shot inference helper (single call, no batch)
+def qwen_infer(prompt: str, max_new: int = 120) -> str:
+    inputs = tokenizer(prompt, return_tensors="pt")
+    with torch.no_grad():
+        out = model.generate(**inputs, max_new_tokens=max_new, temperature=0.7, do_sample=True)
+    return tokenizer.decode(out[0], skip_special_tokens=True)
+
+# Quick test
+test_prompt = "List 3-5 short topics from this text in JSON: \"We grew revenue 12% thanks to AI products.\""
+print("\nTest inference:")
+print(qwen_infer(test_prompt)[:200])
+
+# ------------------------------------------------------------
+# Cell 7.5 – Reload & Filter to 2024 (Fix 'd' not defined)
+# ------------------------------------------------------------
+
+from datasets import load_dataset
+import pandas as pd
+
+print("Loading dataset...")
+ds = load_dataset("kurry/sp500_earnings_transcripts", split="train")
+
+# Flatten into utterances
+rows = []
+for t_id, rec in enumerate(ds):
+    meta = {
+        "transcript_id": t_id,
+        "symbol": rec["symbol"],
+        "company_name": rec["company_name"],
+        "date": rec["date"],
+        "quarter": rec["quarter"],
+        "year": rec["year"],
+    }
+    for seg_id, seg in enumerate(rec["structured_content"]):
+        rows.append({
+            **meta,
+            "seg_id": seg_id,
+            "speaker": seg["speaker"],
+            "text": seg["text"],
+        })
+
+utterances = pd.DataFrame(rows)
+utterances["date"] = pd.to_datetime(utterances["date"], errors="coerce")
+
+# Filter to 2024
+d = utterances[utterances["year"] == 2024].copy().reset_index(drop=True)
+
+print(f"Success! d created → {len(d):,} utterances from {d['company_name'].nunique()} companies in 2024")
+
+# ------------------------------------------------------------
+# Cell 8 – Topic Discovery using Qwen2-1.5B (CPU)
+# ------------------------------------------------------------
+
+import random
+import re
+from collections import Counter
+
+# 1. Sample 1,000 utterances from 2024
+sample_utter = d.sample(n=1000, random_state=42).reset_index(drop=True)
+print(f"Sampled {len(sample_utter):,} utterances for topic discovery")
+
+# 2. Prompt template for topic extraction
+TOPIC_PROMPT = """Extract 3–5 short, meaningful topics from this earnings-call snippet.
+Return ONLY a JSON list like: ["topic 1", "topic 2", ...]
+Do NOT add explanations.
+
+Text:
+{text}
+"""
+
+# 3. Run inference on each sample (progress bar)
+print("\nRunning LLM on 1,000 samples (CPU – will take ~3–5 mins)...")
+extracted_topics = []
+
+for i, row in sample_utter.iterrows():
+    if i % 200 == 0:
+        print(f"  → Processed {i}/{len(sample_utter)}")
+
+    clean_txt = clean_text(row["text"])
+    if len(clean_txt) < 20:  # skip very short
+        continue
+
+    prompt = TOPIC_PROMPT.format(text=clean_txt)
+    response = qwen_infer(prompt, max_new=80)
+
+    # Extract JSON list with regex fallback
+    match = re.search(r'\[\s*"(.*?)"\s*(?:,\s*"(.*?)")*\s*\]', response)
+    if match:
+        topics = [t.strip().lower() for t in match.groups() if t]
+        extracted_topics.extend(topics)
+    else:
+        # Fallback: split by comma or newline
+        fallback = [t.strip().lower() for t in re.split(r',|\n', response) if len(t) > 3]
+        extracted_topics.extend(fallback[:5])
+
+print(f"\nDone! Extracted {len(extracted_topics):,} raw topic phrases")
+
+# 4. Deduplicate & rank by frequency
+topic_counter = Counter(extracted_topics)
+top_n = 60
+unique_topics = [topic for topic, _ in topic_counter.most_common(top_n)]
+
+print(f"\nTop {top_n} discovered topics (frequency):")
+for t, cnt in topic_counter.most_common(10):
+    print(f"  • {t:<25} ({cnt})")
+
+print(f"\nFinal topic vocabulary size: {len(unique_topics)}")
+
