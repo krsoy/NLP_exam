@@ -9,3 +9,4 @@ plotly
 ollama
 umap-learn
 hdbscan
+gensim
